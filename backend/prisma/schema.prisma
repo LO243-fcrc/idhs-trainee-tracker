@@ -1,0 +1,335 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum ContentType {
+  VIDEO
+  PDF
+  TEXT
+}
+
+enum ProgressStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+// Job-performance categories, separate from course/module completion.
+// Ten fixed categories: the original five, Timeliness, and four sourced
+// from the federal SNAP Quality Control framework.
+enum MetricCategory {
+  POLICY_EFFICIENCY
+  IES_EFFICIENCY
+  CASE_COMMENTS_QUALITY
+  INTERVIEWING_IN_PERSON
+  INTERVIEWING_PHONE
+  TIMELINESS
+  ELIGIBILITY_BENEFIT_ACCURACY
+  VERIFICATION_THOROUGHNESS
+  NOTICE_PROCEDURAL_ACCURACY
+  DATA_ENTRY_ACCURACY
+}
+
+// Admin-customizable skill areas for trainee self-report "need help" dropdown
+model SkillArea {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  label     String
+  order     Int      @default(0)
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@map("skill_areas")
+}
+
+// Optional tag on a metric entry: what kind of case action was the trainee
+// handling when they were scored.
+enum CaseActionType {
+  INTAKE
+  CHANGE
+  ADD_MEMBER
+  ADD_PROGRAM
+  REDETERMINATION
+}
+
+// The two case types a trainee progresses through. Each is tracked
+// independently for authorization and second-party-review status.
+enum CaseType {
+  MEDICAL
+  SNAP
+}
+
+// A single step in the authorization/review-independence pipeline for one
+// case type. Always trainer-recommends -> manager-approves, for both the
+// "can this trainee work this case type at all" gate and the separate
+// "does this trainee still need second-party review on this case type" gate.
+enum CaseTypeEventType {
+  AUTHORIZATION_RECOMMENDED
+  AUTHORIZATION_APPROVED
+  REVIEW_INDEPENDENCE_RECOMMENDED
+  REVIEW_INDEPENDENCE_APPROVED
+}
+
+// Outcome of a manager's second-party review of a trainee's certified work.
+// Never references a specific client or case number - only the outcome.
+enum ReviewOutcome {
+  CERTIFIED
+  RETURNED_FOR_CORRECTIONS
+}
+
+// Management account roles. ADMIN can provision other accounts and assign
+// trainer/manager relationships; MANAGEMENT covers everyone else (trainers,
+// direct managers). Both have identical access to trainee data itself -
+// this only gates account/relationship administration, not day-to-day use.
+enum UserRole {
+  ADMIN
+  MANAGEMENT
+}
+
+// Which relationship changed in an AssignmentHistory entry.
+enum AssignmentRole {
+  TRAINER
+  DIRECT_MANAGER
+  BACKUP_MANAGER
+}
+
+// Management/admin accounts only. The only people who log in with full
+// access to the app.
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         UserRole @default(MANAGEMENT)
+  createdAt    DateTime @default(now())
+  archivedAt   DateTime?
+
+  coursesCreated       Course[]            @relation("CourseCreator")
+  traineesAsTrainer    Trainee[]           @relation("Trainer")
+  traineesAsManager    Trainee[]           @relation("DirectManager")
+  traineesAsBackupManager Trainee[]        @relation("BackupManager")
+  caseTypeEventsActed  CaseTypeEvent[]     @relation("CaseTypeEventActor")
+  reviewsGiven         SecondPartyReview[] @relation("ReviewingManager")
+  assignmentChangesMade AssignmentHistory[] @relation("AssignmentHistoryChangedBy")
+
+  @@map("users")
+}
+
+// A tracked trainee. Not a management login - trainees get a separate,
+// narrowly-scoped login (username/passwordHash below) that can only reach
+// the daily self-report form, nothing else in the app.
+model Trainee {
+  id           String    @id @default(uuid())
+  name         String
+  email        String?   @unique
+  createdAt    DateTime  @default(now())
+
+  // Soft-archive, not a hard delete - archived trainees keep all their
+  // history (metrics, reviews, self-reports) but drop out of the active
+  // dashboard/matrix. Null means active.
+  archivedAt   DateTime?
+
+  // Start of employment - anchors the 3/6/9/12-month evaluation schedule.
+  // Nullable because a trainee record might be created before this is known.
+  employmentStartDate DateTime?
+
+  // Self-report login - separate from management User accounts entirely.
+  selfReportToken        String? @unique
+
+  // 10 Week Highway Training: external, static curriculum. The app only
+  // tracks when it started/ended for this trainee, never the curriculum
+  // itself. "Completed" is derived from whether an end date is set.
+  highwayTrainingStartDate DateTime?
+  highwayTrainingEndDate   DateTime?
+
+  trainerId       String?
+  trainer         User?   @relation("Trainer", fields: [trainerId], references: [id])
+  directManagerId String?
+  directManager   User?   @relation("DirectManager", fields: [directManagerId], references: [id])
+  // The manager and backup manager are specifically the two people who
+  // perform second-party review for this trainee - the backup exists for
+  // coverage when the primary direct manager is unavailable.
+  backupManagerId String?
+  backupManager   User?   @relation("BackupManager", fields: [backupManagerId], references: [id])
+
+  progress           Progress[]
+  courseCompletions  CourseCompletion[]
+  performanceMetrics PerformanceMetric[]
+  caseTypeEvents      CaseTypeEvent[]
+  secondPartyReviews SecondPartyReview[]
+  dailyReports       DailySelfReport[]
+  assignmentHistory  AssignmentHistory[]
+
+  @@map("trainees")
+}
+
+model Course {
+  id          String   @id @default(uuid())
+  title       String
+  description String?
+  createdBy   String
+  creator     User     @relation("CourseCreator", fields: [createdBy], references: [id])
+  createdAt   DateTime @default(now())
+
+  modules     Module[]
+  completions CourseCompletion[]
+
+  @@map("courses")
+}
+
+model Module {
+  id          String      @id @default(uuid())
+  courseId    String
+  course      Course      @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  title       String
+  contentType ContentType
+  contentUrl  String
+  order       Int
+
+  progress    Progress[]
+
+  @@index([courseId, order])
+  @@map("modules")
+}
+
+// Progress is keyed to a Trainee, not a User - it's set by management, not
+// self-reported. There is no "locked" concept: management can set any
+// module's status at any time.
+model CourseCompletion {
+  id        String   @id @default(cuid())
+  traineeId String
+  trainee   Trainee  @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  courseId  String
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  status    String   @default("NOT_STARTED")
+  completedAt DateTime?
+  recordedAt  DateTime @default(now())
+
+  @@unique([traineeId, courseId])
+  @@index([traineeId])
+  @@map("course_completions")
+}
+
+model Progress {
+  id        String         @id @default(uuid())
+  traineeId String
+  trainee   Trainee        @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  moduleId  String
+  module    Module         @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  status    ProgressStatus @default(NOT_STARTED)
+  updatedAt DateTime       @updatedAt
+
+  @@unique([traineeId, moduleId])
+  @@map("progress")
+}
+
+// A management-entered score (0-100) for one performance category for one
+// trainee. Append-only history log - every scoring event is its own row.
+model PerformanceMetric {
+  id             String          @id @default(uuid())
+  traineeId      String
+  trainee        Trainee         @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  category       MetricCategory
+  score          Int
+  notes          String?
+  caseActionType CaseActionType?
+  createdAt      DateTime        @default(now())
+
+  @@index([traineeId, category])
+  @@map("performance_metrics")
+}
+
+// Static, read-only reference content for the 10 Week Highway Training.
+// Seeded once; never editable through the normal course-management UI,
+// since the curriculum belongs to an outside training authority.
+model HighwayTrainingWeek {
+  id          String @id @default(uuid())
+  weekNumber  Int    @unique
+  topic       String
+  expectation String
+
+  @@map("highway_training_weeks")
+}
+
+// One step (recommend or approve) in either the case-type authorization
+// pipeline or the review-independence pipeline, for one trainee + case type.
+// Current status is derived by reading the latest events, not stored
+// directly - keeps this consistent with every other history-log model here.
+model CaseTypeEvent {
+  id         String            @id @default(uuid())
+  traineeId  String
+  trainee    Trainee           @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  caseType   CaseType
+  eventType  CaseTypeEventType
+  actingUserId String
+  actingUser   User            @relation("CaseTypeEventActor", fields: [actingUserId], references: [id])
+  notes      String?
+  createdAt  DateTime          @default(now())
+
+  @@index([traineeId, caseType])
+  @@map("case_type_events")
+}
+
+// A manager's second-party review outcome for a trainee's work. Never
+// references a specific client or case number - HIPAA-safe by design.
+model SecondPartyReview {
+  id             String         @id @default(uuid())
+  traineeId      String
+  trainee        Trainee        @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  caseType       CaseType
+  caseActionType CaseActionType?
+  outcome        ReviewOutcome
+  reviewedById   String
+  reviewedBy     User           @relation("ReviewingManager", fields: [reviewedById], references: [id])
+  notes          String?
+  createdAt      DateTime       @default(now())
+
+  @@index([traineeId, caseType])
+  @@map("second_party_reviews")
+}
+
+// A trainee's own daily self-report. One per trainee per day. Submitted
+// through the trainee's narrowly-scoped self-report login.
+model DailySelfReport {
+  id                String          @id @default(uuid())
+  traineeId         String
+  trainee           Trainee         @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  reportDate        DateTime        @db.Date
+  medicalCasesDone  Int
+  snapCasesDone     Int
+  casesCertified    Int
+  casesPending      Int
+  helpNeededCategory MetricCategory?
+  createdAt         DateTime        @default(now())
+
+  @@unique([traineeId, reportDate])
+  @@map("daily_self_reports")
+}
+
+// Append-only log of trainer/direct-manager/backup-manager changes for a
+// trainee - what "streamlined handoff" means here: reassigning is one
+// action, and every change leaves a record of who it was, who changed it,
+// and why. previousUserId/newUserId are plain IDs (not FK relations) since
+// either can be null (unassigned) and the frontend already has the
+// management user list to resolve names from.
+model AssignmentHistory {
+  id             String         @id @default(uuid())
+  traineeId      String
+  trainee        Trainee        @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  role           AssignmentRole
+  previousUserId String?
+  newUserId      String?
+  changedById    String
+  changedBy      User           @relation("AssignmentHistoryChangedBy", fields: [changedById], references: [id])
+  note           String?
+  createdAt      DateTime       @default(now())
+
+  @@index([traineeId])
+  @@map("assignment_history")
+}
