@@ -1,0 +1,268 @@
+import { useState, useEffect } from 'react';
+import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, useDialogContext } = require('@/components/ui/dialog');
+import { api } from '@/lib/api';
+
+const METRIC_CATEGORIES = [
+  'POLICY_EFFICIENCY',
+  'IES_EFFICIENCY',
+  'DATA_ENTRY_ACCURACY',
+  'CASE_COMMENTS_QUALITY',
+  'INTERVIEWING_IN_PERSON',
+  'INTERVIEWING_PHONE',
+  'TIMELINESS',
+  'ELIGIBILITY_BENEFIT_ACCURACY',
+  'VERIFICATION_THOROUGHNESS',
+  'NOTICE_PROCEDURAL_ACCURACY',
+];
+
+function getCategoryLabel(category) {
+  const labels = {
+    'POLICY_EFFICIENCY': 'Policy Efficiency',
+    'IES_EFFICIENCY': 'IES Efficiency',
+    'DATA_ENTRY_ACCURACY': 'Data Entry Accuracy',
+    'CASE_COMMENTS_QUALITY': 'Case Comments Quality',
+    'INTERVIEWING_IN_PERSON': 'Interviewing (In-Person)',
+    'INTERVIEWING_PHONE': 'Interviewing (Phone)',
+    'TIMELINESS': 'Timeliness',
+    'ELIGIBILITY_BENEFIT_ACCURACY': 'Eligibility & Benefit Accuracy',
+    'VERIFICATION_THOROUGHNESS': 'Verification Thoroughness',
+    'NOTICE_PROCEDURAL_ACCURACY': 'Notice & Procedural Accuracy',
+  };
+  return labels[category] || category;
+}
+
+function ReviewForm({ trainee, reviewNumber, existingReview, onSaved }) {
+  const { setIsOpen } = useDialogContext();
+  const [scores, setScores] = useState({});
+  const [notes, setNotes] = useState('');
+  const [decision, setDecision] = useState('PENDING');
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [isLoading, setIsLoading] = useState(!existingReview);
+
+  useEffect(() => {
+    if (existingReview) {
+      setScores(existingReview.scores || {});
+      setNotes(existingReview.notes || '');
+      setDecision(existingReview.decision || 'PENDING');
+      setIsLoading(false);
+    } else {
+      loadAutoPopulatedScores();
+    }
+  }, [existingReview]);
+
+  async function loadAutoPopulatedScores() {
+    try {
+      // Create the review to get auto-populated scores
+      const newReview = await api.createReview(trainee.id, reviewNumber);
+      setScores(newReview.scores || {});
+      setNotes('');
+      setDecision('PENDING');
+      setIsLoading(false);
+    } catch (err) {
+      // If review already exists, get it
+      if (err.message?.includes('already exists')) {
+        const traineeReviews = await api.getTraineeReviews(trainee.id);
+        const review = traineeReviews.reviews.find(r => r.reviewNumber === reviewNumber);
+        if (review) {
+          setScores(review.scores || {});
+          setNotes(review.notes || '');
+          setDecision(review.decision || 'PENDING');
+        }
+      } else {
+        setError(err.message);
+      }
+      setIsLoading(false);
+    }
+  }
+
+  function handleScoreChange(category, value) {
+    const numValue = Math.max(0, Math.min(100, parseInt(value) || 0));
+    setScores({ ...scores, [category]: numValue });
+  }
+
+  function calculatePassed() {
+    return Object.values(scores).every(score => score >= 70);
+  }
+
+  function getFailedCategories() {
+    return Object.entries(scores)
+      .filter(([, score]) => score < 70)
+      .map(([category]) => category);
+  }
+
+  async function handleSave() {
+    try {
+      setError('');
+      setIsSaving(true);
+
+      const data = {
+        scores,
+        notes,
+        decision,
+        overriddenCategories: null,
+      };
+
+      if (existingReview) {
+        await api.updateReview(existingReview.id, data);
+      } else {
+        // Get the created review to update it
+        const traineeReviews = await api.getTraineeReviews(trainee.id);
+        const review = traineeReviews.reviews.find(r => r.reviewNumber === reviewNumber);
+        if (review) {
+          await api.updateReview(review.id, data);
+        }
+      }
+
+      onSaved();
+      setIsOpen(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  const monthLabel = reviewNumber === 4 ? '12-Month (Certification)' : `${reviewNumber * 3}-Month`;
+  const passed = calculatePassed();
+  const failedCategories = getFailedCategories();
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-md bg-slate-50 p-3">
+        <p className="text-sm font-medium text-slate-900">{trainee.name}</p>
+        <p className="text-xs text-slate-600">{monthLabel} Review</p>
+      </div>
+
+      {error && (
+        <div className="rounded-md bg-red-50 p-3 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+
+      {isLoading ? (
+        <p className="text-sm text-slate-500">Loading scores...</p>
+      ) : (
+        <>
+          {/* Scores Grid */}
+          <div className="space-y-3 max-h-64 overflow-y-auto">
+            <p className="text-sm font-semibold text-slate-900">Performance Scores (0-100)</p>
+            {METRIC_CATEGORIES.map((category) => (
+              <div key={category} className="flex items-center gap-3">
+                <label className="flex-1 text-sm text-slate-600 w-40">
+                  {getCategoryLabel(category)}
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={scores[category] || 0}
+                  onChange={(e) => handleScoreChange(category, e.target.value)}
+                  className={`w-16 rounded border px-2 py-1 text-sm ${
+                    scores[category] < 70
+                      ? 'border-red-300 bg-red-50'
+                      : 'border-slate-300'
+                  }`}
+                />
+                <span className={`text-xs font-medium w-8 ${scores[category] >= 70 ? 'text-green-700' : 'text-red-700'}`}>
+                  {scores[category] >= 70 ? '✓' : '✗'}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* Status */}
+          <div className="rounded-md bg-blue-50 p-3">
+            <p className="text-sm font-medium text-blue-900">
+              {passed ? '✓ All scores ≥ 70 (PASS eligible)' : `✗ ${failedCategories.length} categories below 70`}
+            </p>
+          </div>
+
+          {/* Notes */}
+          <div>
+            <label className="block text-sm font-medium text-slate-900 mb-1">
+              Manager Notes
+            </label>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              rows="3"
+              className="w-full rounded border border-slate-300 px-3 py-2 text-sm"
+              placeholder="Add comments about overall performance..."
+            />
+          </div>
+
+          {/* Decision */}
+          <div>
+            <p className="text-sm font-medium text-slate-900 mb-2">Decision</p>
+            <div className="flex gap-2">
+              <Button
+                variant={decision === 'PASS' ? 'default' : 'outline'}
+                onClick={() => setDecision('PASS')}
+                disabled={!passed}
+                className="flex-1"
+              >
+                Pass
+              </Button>
+              <Button
+                variant={decision === 'FAIL' ? 'danger' : 'outline'}
+                onClick={() => setDecision('FAIL')}
+                className="flex-1"
+              >
+                Fail
+              </Button>
+              <Button
+                variant={decision === 'PENDING' ? 'default' : 'outline'}
+                onClick={() => setDecision('PENDING')}
+                className="flex-1"
+              >
+                Pending
+              </Button>
+            </div>
+          </div>
+
+          {/* Save/Cancel */}
+          <div className="flex gap-2 pt-4">
+            <Button
+              onClick={handleSave}
+              disabled={isSaving}
+              className="flex-1"
+            >
+              {isSaving ? 'Saving...' : 'Save Review'}
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => setIsOpen(false)}
+              disabled={isSaving}
+              className="flex-1"
+            >
+              Cancel
+            </Button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+export default function ReviewModal({ isOpen, onClose, trainee, reviewNumber, existingReview, onSaved }) {
+  const monthLabel = reviewNumber === 4 ? '12-Month (Certification)' : `${reviewNumber * 3}-Month`;
+  const title = existingReview ? `Edit ${monthLabel} Review` : `Create ${monthLabel} Review`;
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        <ReviewForm
+          trainee={trainee}
+          reviewNumber={reviewNumber}
+          existingReview={existingReview}
+          onSaved={onSaved}
+        />
+      </DialogContent>
+    </Dialog>
+  );
+}
